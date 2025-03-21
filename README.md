@@ -278,20 +278,3 @@ python app.py
 
 This starts the server on `0.0.0.0:8000` with auto-reload enabled.
 
-### Docker (Optional)
-
-A Dockerfile could be created with the following content:
-
-```dockerfile
-FROM python:3.9
-
-WORKDIR /app
-
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY . .
-
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
-```
-
