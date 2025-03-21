@@ -1,34 +1,242 @@
-# app.py
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, File, UploadFile, Form, Query
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
-import uvicorn
 import os
-import logging
-from datetime import datetime
-import uuid
-import sqlite3
-import numpy as np
 import json
-import shutil
-from functools import lru_cache
-import pickle
-
-# For demonstration purposes, use simple libraries instead of requiring Ollama and PGVector
+import io
+import logging
+import numpy as np
+from typing import List, Optional, Dict, Any
+from contextlib import asynccontextmanager
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-import pypdf
-import csv
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+import asyncpg
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+import PyPDF2
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
 logger = logging.getLogger(__name__)
 
-# Initialize FastAPI app
-app = FastAPI(title="Document Management and RAG-based Q&A API")
+DB_USER = os.getenv("DB_USER", "postgres")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "password")
+DB_NAME = os.getenv("DB_NAME", "database")
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = int(os.getenv("DB_PORT", "5432"))
+VECTOR_STORE_PATH = os.getenv("VECTOR_STORE_PATH", "tfidf_index")
 
-# Add CORS middleware
+class Document(BaseModel):
+    id: Optional[int] = None
+    title: str
+    content: str
+    metadata: Dict[str, Any] = {}
+
+class Query(BaseModel):
+    question: str
+    
+class Answer(BaseModel):
+    answer: str
+    sources: List[Dict[str, Any]] = []
+
+class ErrorResponse(BaseModel):
+    detail: str
+
+async def get_db_pool():
+    try:
+        pool = await asyncpg.create_pool(
+            user=DB_USER,
+            password=DB_PASSWORD,
+            database=DB_NAME,
+            host=DB_HOST,
+            port=DB_PORT,
+            command_timeout=60
+        )
+        return pool
+    except Exception as e:
+        logger.error(f"Database connection error: {e}")
+        return None
+
+def parse_metadata(metadata):
+    if isinstance(metadata, str):
+        try:
+            return json.loads(metadata)
+        except json.JSONDecodeError:
+            return {}
+    elif isinstance(metadata, dict):
+        return metadata
+    else:
+        return {}
+
+def extract_text_from_file(file_content, file_name):
+    file_ext = os.path.splitext(file_name.lower())[1]
+    
+    if file_ext == '.pdf':
+        try:
+            pdf_reader = PyPDF2.PdfReader(io.BytesIO(file_content))
+            text = ""
+            for page in pdf_reader.pages:
+                text += page.extract_text() + "\n"
+            return text
+        except Exception as e:
+            return f"Error extracting text: {str(e)}"
+    
+    elif file_ext in ['.txt', '.csv', '.md']:
+        try:
+            return file_content.decode('utf-8')
+        except UnicodeDecodeError:
+            try:
+                return file_content.decode('latin-1')
+            except Exception as e:
+                return f"Error decoding text: {str(e)}"
+    
+    else:
+        return f"Unsupported file type: {file_ext}"
+
+def split_text(text, chunk_size=1000, chunk_overlap=200):
+    if not text:
+        return []
+        
+    chunks = []
+    for i in range(0, len(text), chunk_size - chunk_overlap):
+        chunk = text[i:i + chunk_size]
+        if chunk:
+            chunks.append(chunk)
+    return chunks
+
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Global exception: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"An error occurred: {str(exc)}"}
+    )
+
+class TfidfVectorStore:
+    def __init__(self):
+        self.vectorizer = TfidfVectorizer()
+        self.documents = []
+        self.doc_texts = []
+        self.doc_metadatas = []
+        self.matrix = None
+        
+    def add_texts(self, texts, metadatas=None):
+        if not metadatas:
+            metadatas = [{} for _ in texts]
+            
+        self.documents.extend(list(zip(texts, metadatas)))
+        self.doc_texts.extend(texts)
+        self.doc_metadatas.extend(metadatas)
+        
+        self.matrix = self.vectorizer.fit_transform(self.doc_texts)
+        
+    def similarity_search(self, query, k=3):
+        if not self.doc_texts:
+            return []
+            
+        query_vec = self.vectorizer.transform([query])
+        
+        similarity_scores = cosine_similarity(query_vec, self.matrix)[0]
+        
+        top_indices = np.argsort(similarity_scores)[::-1][:k]
+        
+        results = []
+        for idx in top_indices:
+            if idx < len(self.documents):
+                doc_text, doc_metadata = self.documents[idx]
+                doc = type('Document', (), {
+                    'page_content': doc_text,
+                    'metadata': doc_metadata
+                })
+                results.append(doc)
+        
+        return results
+        
+    def as_retriever(self, search_type=None, search_kwargs=None):
+        if not search_kwargs:
+            search_kwargs = {}
+        k = search_kwargs.get('k', 3)
+            
+        class SimpleRetriever:
+            def __init__(self, vector_store, k):
+                self.vector_store = vector_store
+                self.k = k
+                
+            def get_relevant_documents(self, query):
+                return self.vector_store.similarity_search(query, self.k)
+                
+        return SimpleRetriever(self, k)
+        
+    def save_local(self, path):
+        if not os.path.exists(os.path.dirname(path)):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            
+        with open(f"{path}_docs.json", 'w') as f:
+            json.dump([(text, meta) for text, meta in zip(self.doc_texts, self.doc_metadatas)], f)
+        
+    @classmethod
+    def load_local(cls, path):
+        vector_store = cls()
+        try:
+            if os.path.exists(f"{path}_docs.json"):
+                with open(f"{path}_docs.json", 'r') as f:
+                    docs_data = json.load(f)
+                    texts = [item[0] for item in docs_data]
+                    metadatas = [item[1] for item in docs_data]
+                    vector_store.add_texts(texts, metadatas)
+            return vector_store
+        except Exception as e:
+            logger.error(f"Error loading vector store: {e}")
+            return vector_store
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Starting up the application...")
+    app.state.has_error = False
+    
+    try:
+        app.state.db_pool = await get_db_pool()
+        if app.state.db_pool:
+            logger.info("Database connection established")
+        else:
+            logger.warning("Failed to establish database connection")
+            app.state.has_error = True
+    except Exception as e:
+        logger.error(f"Database startup error: {e}")
+        app.state.db_pool = None
+        app.state.has_error = True
+    
+    app.state.vector_store = None
+    
+    if os.path.exists(f"{VECTOR_STORE_PATH}_docs.json"):
+        try:
+            app.state.vector_store = TfidfVectorStore.load_local(VECTOR_STORE_PATH)
+        except Exception:
+            pass
+    else:
+        app.state.vector_store = TfidfVectorStore()
+        
+    yield
+    
+    if hasattr(app.state, "db_pool") and app.state.db_pool:
+        await app.state.db_pool.close()
+    
+    if hasattr(app.state, "vector_store") and app.state.vector_store:
+        try:
+            os.makedirs(os.path.dirname(VECTOR_STORE_PATH), exist_ok=True)
+            app.state.vector_store.save_local(VECTOR_STORE_PATH)
+        except Exception as e:
+            logger.error(f"Error saving vector store: {e}")
+
+app = FastAPI(
+    title="Document Management and RAG-based Q&A API",
+    description="API for managing documents and performing question answering with TF-IDF based retrieval",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -37,419 +245,258 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Create necessary directories
-os.makedirs("uploads", exist_ok=True)
-os.makedirs("db", exist_ok=True)
+app.add_exception_handler(Exception, global_exception_handler)
 
-# Database initialization
-DB_PATH = "db/docmanagement.db"
+async def get_db():
+    if app.state.db_pool is None:
+        app.state.db_pool = await get_db_pool()
+        
+    if app.state.db_pool is None:
+        raise HTTPException(status_code=503, detail="Database connection not available")
+        
+    async with app.state.db_pool.acquire() as connection:
+        yield connection
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    # Create users table
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS users (
-        id TEXT PRIMARY KEY,
-        username TEXT UNIQUE,
-        email TEXT UNIQUE,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    ''')
-    
-    # Create documents table
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS documents (
-        id TEXT PRIMARY KEY,
-        title TEXT,
-        description TEXT,
-        file_path TEXT,
-        file_type TEXT,
-        user_id TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        processed BOOLEAN DEFAULT 0,
-        collection_name TEXT,
-        FOREIGN KEY (user_id) REFERENCES users (id)
-    )
-    ''')
-    
-    conn.commit()
-    conn.close()
-
-# Initialize DB on startup
-init_db()
-
-# Path to store embeddings
-EMBEDDINGS_DIR = "db/embeddings"
-os.makedirs(EMBEDDINGS_DIR, exist_ok=True)
-
-# Pydantic models for request/response
-class UserCreate(BaseModel):
-    username: str
-    email: str
-
-class UserResponse(BaseModel):
-    id: str
-    username: str
-    email: str
-    created_at: datetime
-
-class DocumentCreate(BaseModel):
-    title: str
-    description: Optional[str] = None
-
-class DocumentResponse(BaseModel):
-    id: str
-    title: str
-    description: Optional[str]
-    file_type: str
-    created_at: str
-    processed: bool
-
-class QuestionRequest(BaseModel):
-    question: str
-    document_ids: Optional[List[str]] = None
-
-class AnswerResponse(BaseModel):
-    question: str
-    answer: str
-    sources: List[str]
-
-# Helper functions
-def get_db_connection():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-@lru_cache(maxsize=10)
-def get_vectorizer():
-    return TfidfVectorizer(stop_words='english')
-
-# Function to extract text from various file types
-def extract_text_from_file(file_path):
-    file_ext = os.path.splitext(file_path)[1].lower()
-    
-    if file_ext == '.pdf':
-        text = ""
-        with open(file_path, 'rb') as f:
-            pdf_reader = pypdf.PdfReader(f)
-            for page in pdf_reader.pages:
-                text += page.extract_text() + "\n"
-        return text
-    
-    elif file_ext == '.csv':
-        text = ""
-        with open(file_path, 'r', encoding='utf-8') as f:
-            csv_reader = csv.reader(f)
-            for row in csv_reader:
-                text += " ".join(row) + "\n"
-        return text
-    
-    else:  # Default to treating as text file
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                return f.read()
-        except UnicodeDecodeError:
-            # Try with a different encoding if UTF-8 fails
-            with open(file_path, 'r', encoding='latin-1') as f:
-                return f.read()
-
-# Function to chunk text into smaller segments
-def chunk_text(text, chunk_size=1000, overlap=200):
-    words = text.split()
-    chunks = []
-    
-    i = 0
-    while i < len(words):
-        chunk = " ".join(words[i:i + chunk_size])
-        chunks.append(chunk)
-        i += chunk_size - overlap
-    
-    return chunks
-
-# Function to process document and generate embeddings
-async def process_document(document_id: str):
+async def init_db(connection):
     try:
-        conn = get_db_connection()
-        document = conn.execute("SELECT * FROM documents WHERE id = ?", (document_id,)).fetchone()
-        if not document:
-            logger.error(f"Document not found: {document_id}")
-            conn.close()
-            return
-        
-        document = dict(document)
-        logger.info(f"Processing document: {document['title']}")
-        
-        # Extract text from document
-        text = extract_text_from_file(document['file_path'])
-        
-        # Chunk the text
-        chunks = chunk_text(text)
-        
-        # Generate collection name
-        collection_name = f"doc_{document_id.replace('-', '_')}"
-        
-        # Generate embeddings using TF-IDF
-        vectorizer = get_vectorizer()
-        tfidf_matrix = vectorizer.fit_transform(chunks)
-        
-        # Save vectorizer, matrix, and chunks
-        embedding_path = os.path.join(EMBEDDINGS_DIR, f"{collection_name}.pkl")
-        with open(embedding_path, 'wb') as f:
-            pickle.dump({
-                'vectorizer': vectorizer,
-                'tfidf_matrix': tfidf_matrix,
-                'chunks': chunks
-            }, f)
-        
-        # Update document in database
-        conn.execute(
-            "UPDATE documents SET processed = 1, collection_name = ? WHERE id = ?",
-            (collection_name, document_id)
-        )
-        conn.commit()
-        conn.close()
-        
-        logger.info(f"Document processed successfully: {document['title']}")
+        await connection.execute('''
+            CREATE TABLE IF NOT EXISTS documents (
+                id SERIAL PRIMARY KEY,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                metadata JSONB DEFAULT '{}'
+            )
+        ''')
     except Exception as e:
-        logger.error(f"Error processing document: {str(e)}")
-        try:
-            conn.rollback()
-            conn.close()
-        except:
-            pass
+        raise HTTPException(status_code=500, detail=f"Database initialization error: {str(e)}")
 
-# API endpoints
-@app.post("/users/", response_model=UserResponse)
-async def create_user(user: UserCreate):
-    conn = get_db_connection()
-    user_id = str(uuid.uuid4())
-    created_at = datetime.now().isoformat()
+@app.get("/", response_model=Dict[str, Any])
+async def root():
+    status = "healthy"
+    components = {
+        "database": "connected" if app.state.db_pool else "disconnected",
+        "vector_store": "initialized" if app.state.vector_store else "not initialized"
+    }
     
-    try:
-        conn.execute(
-            "INSERT INTO users (id, username, email, created_at) VALUES (?, ?, ?, ?)",
-            (user_id, user.username, user.email, created_at)
-        )
-        conn.commit()
-        
-        user_data = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-        conn.close()
-        
-        return {
-            "id": user_data["id"],
-            "username": user_data["username"],
-            "email": user_data["email"],
-            "created_at": datetime.fromisoformat(user_data["created_at"])
-        }
-    except Exception as e:
-        conn.close()
-        raise HTTPException(status_code=400, detail=f"Error creating user: {str(e)}")
-
-@app.get("/users/", response_model=List[UserResponse])
-async def get_users(skip: int = 0, limit: int = 100):
-    conn = get_db_connection()
-    users = conn.execute("SELECT * FROM users LIMIT ? OFFSET ?", (limit, skip)).fetchall()
-    conn.close()
-    
-    return [{
-        "id": user["id"],
-        "username": user["username"],
-        "email": user["email"],
-        "created_at": datetime.fromisoformat(user["created_at"])
-    } for user in users]
-
-@app.post("/documents/", response_model=DocumentResponse)
-async def upload_document(
-    background_tasks: BackgroundTasks,
-    title: str = Form(...),
-    description: Optional[str] = Form(None),
-    file: UploadFile = File(...),
-    user_id: str = Form(...)
-):
-    # Check if user exists
-    conn = get_db_connection()
-    user = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-    if not user:
-        conn.close()
-        raise HTTPException(status_code=404, detail="User not found")
-    
-    # Create document directory if it doesn't exist
-    upload_dir = os.path.join("uploads", user_id)
-    os.makedirs(upload_dir, exist_ok=True)
-    
-    # Save the uploaded file
-    file_path = os.path.join(upload_dir, file.filename)
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    
-    # Get file extension
-    file_type = os.path.splitext(file.filename)[1].replace(".", "")
-    
-    # Create document in database
-    document_id = str(uuid.uuid4())
-    created_at = datetime.now().isoformat()
-    
-    conn.execute(
-        """
-        INSERT INTO documents 
-        (id, title, description, file_path, file_type, user_id, created_at, processed) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, 0)
-        """,
-        (document_id, title, description, file_path, file_type, user_id, created_at)
-    )
-    conn.commit()
-    
-    document_data = conn.execute("SELECT * FROM documents WHERE id = ?", (document_id,)).fetchone()
-    conn.close()
-    
-    # Process document in background
-    background_tasks.add_task(process_document, document_id)
+    if app.state.has_error:
+        status = "degraded"
     
     return {
-        "id": document_data["id"],
-        "title": document_data["title"],
-        "description": document_data["description"],
-        "file_type": document_data["file_type"],
-        "created_at": document_data["created_at"],
-        "processed": bool(document_data["processed"])
+        "message": "Document Management and RAG-based Q&A Application (TF-IDF Edition)",
+        "status": status,
+        "components": components
     }
 
-@app.get("/documents/", response_model=List[DocumentResponse])
-async def get_documents(user_id: Optional[str] = None, skip: int = 0, limit: int = 100):
-    conn = get_db_connection()
-    
-    if user_id:
-        documents = conn.execute(
-            "SELECT * FROM documents WHERE user_id = ? LIMIT ? OFFSET ?",
-            (user_id, limit, skip)
-        ).fetchall()
-    else:
-        documents = conn.execute(
-            "SELECT * FROM documents LIMIT ? OFFSET ?",
-            (limit, skip)
-        ).fetchall()
-    
-    conn.close()
-    
-    return [{
-        "id": doc["id"],
-        "title": doc["title"],
-        "description": doc["description"],
-        "file_type": doc["file_type"],
-        "created_at": doc["created_at"],
-        "processed": bool(doc["processed"])
-    } for doc in documents]
-
-@app.get("/documents/{document_id}", response_model=DocumentResponse)
-async def get_document(document_id: str):
-    conn = get_db_connection()
-    document = conn.execute("SELECT * FROM documents WHERE id = ?", (document_id,)).fetchone()
-    conn.close()
-    
-    if not document:
-        raise HTTPException(status_code=404, detail="Document not found")
-    
-    return {
-        "id": document["id"],
-        "title": document["title"],
-        "description": document["description"],
-        "file_type": document["file_type"],
-        "created_at": document["created_at"],
-        "processed": bool(document["processed"])
-    }
-
-@app.post("/qa/", response_model=AnswerResponse)
-async def question_answering(request: QuestionRequest):
+@app.post("/documents/", response_model=Document, responses={500: {"model": ErrorResponse}})
+async def create_document(document: Document, connection=Depends(get_db)):
     try:
-        conn = get_db_connection()
+        await init_db(connection)
         
-        # Get document collections to search
-        collections = []
-        document_titles = []
+        result = await connection.fetchrow(
+            "INSERT INTO documents (title, content, metadata) VALUES ($1, $2, $3) RETURNING id",
+            document.title, document.content, json.dumps(document.metadata)
+        )
+        document.id = result["id"]
         
-        if request.document_ids and len(request.document_ids) > 0:
-            for doc_id in request.document_ids:
-                doc = conn.execute("SELECT * FROM documents WHERE id = ? AND processed = 1", (doc_id,)).fetchone()
-                if doc and doc["collection_name"]:
-                    collections.append(doc["collection_name"])
-                    document_titles.append(doc["title"])
+        if app.state.vector_store:
+            chunks = split_text(document.content)
+            metadatas = [{"source": document.title, "doc_id": document.id} for _ in chunks]
+            app.state.vector_store.add_texts(chunks, metadatas=metadatas)
         else:
-            # If no specific documents, search all processed documents
-            docs = conn.execute("SELECT * FROM documents WHERE processed = 1").fetchall()
-            for doc in docs:
-                if doc["collection_name"]:
-                    collections.append(doc["collection_name"])
-                    document_titles.append(doc["title"])
+            app.state.vector_store = TfidfVectorStore()
+            chunks = split_text(document.content)
+            metadatas = [{"source": document.title, "doc_id": document.id} for _ in chunks]
+            app.state.vector_store.add_texts(chunks, metadatas=metadatas)
         
-        conn.close()
+        return document
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create document: {str(e)}")
+
+@app.get("/documents/", response_model=List[Document], responses={500: {"model": ErrorResponse}})
+async def read_documents(connection=Depends(get_db)):
+    try:
+        await init_db(connection)
         
-        if not collections:
-            raise HTTPException(status_code=400, detail="No processed documents available")
+        rows = await connection.fetch("SELECT * FROM documents")
+        documents = []
+        for row in rows:
+            metadata_dict = parse_metadata(row["metadata"])
+            
+            documents.append(Document(
+                id=row["id"],
+                title=row["title"],
+                content=row["content"],
+                metadata=metadata_dict
+            ))
+        return documents
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read documents: {str(e)}")
+
+@app.get("/documents/{document_id}", response_model=Document, responses={404: {"model": ErrorResponse}, 500: {"model": ErrorResponse}})
+async def read_document(document_id: int, connection=Depends(get_db)):
+    try:
+        row = await connection.fetchrow("SELECT * FROM documents WHERE id = $1", document_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Document not found")
         
-        # Retrieve relevant chunks from all collections
-        all_relevant_chunks = []
-        all_similarity_scores = []
+        metadata_dict = parse_metadata(row["metadata"])
         
-        for collection in collections:
-            try:
-                embedding_path = os.path.join(EMBEDDINGS_DIR, f"{collection}.pkl")
-                if not os.path.exists(embedding_path):
+        return Document(
+            id=row["id"],
+            title=row["title"],
+            content=row["content"],
+            metadata=metadata_dict
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read document: {str(e)}")
+
+@app.post("/upload/", response_model=Document, responses={500: {"model": ErrorResponse}})
+async def upload_document(
+    file: UploadFile = File(...),
+    title: str = Form(...),
+    connection=Depends(get_db)
+):
+    try:
+        await init_db(connection)
+        
+        content = await file.read()
+        
+        content_text = extract_text_from_file(content, file.filename)
+        
+        file_metadata = {
+            "filename": file.filename,
+            "content_type": file.content_type,
+            "size_bytes": len(content)
+        }
+        
+        result = await connection.fetchrow(
+            "INSERT INTO documents (title, content, metadata) VALUES ($1, $2, $3) RETURNING id",
+            title, content_text, json.dumps(file_metadata)
+        )
+        
+        document = Document(
+            id=result["id"],
+            title=title,
+            content=content_text,
+            metadata=file_metadata
+        )
+        
+        if app.state.vector_store:
+            chunks = split_text(content_text)
+            metadatas = [{"source": title, "doc_id": document.id} for _ in chunks]
+            app.state.vector_store.add_texts(chunks, metadatas=metadatas)
+        else:
+            app.state.vector_store = TfidfVectorStore()
+            chunks = split_text(content_text)
+            metadatas = [{"source": title, "doc_id": document.id} for _ in chunks]
+            app.state.vector_store.add_texts(chunks, metadatas=metadatas)
+        
+        return document
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to upload document: {str(e)}")
+
+@app.post("/query/", response_model=Answer, responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}})
+async def query_documents(query: Query):
+    try:
+        if not app.state.vector_store:
+            raise HTTPException(status_code=400, detail="No documents have been indexed yet")
+        
+        retriever = app.state.vector_store.as_retriever(
+            search_type="similarity",
+            search_kwargs={"k": 3}
+        )
+        docs = retriever.get_relevant_documents(query.question)
+        
+        context = "\n\n".join([doc.page_content for doc in docs])
+        
+        question_words = set(query.question.lower().split())
+        relevant_sentences = []
+        
+        for doc in docs:
+            sentences = doc.page_content.split('.')
+            for sentence in sentences:
+                sentence = sentence.strip()
+                if not sentence:
                     continue
                     
-                with open(embedding_path, 'rb') as f:
-                    data = pickle.load(f)
-                    
-                vectorizer = data['vectorizer']
-                tfidf_matrix = data['tfidf_matrix']
-                chunks = data['chunks']
-                
-                # Transform the question
-                question_vector = vectorizer.transform([request.question])
-                
-                # Calculate similarity
-                similarity = cosine_similarity(question_vector, tfidf_matrix).flatten()
-                
-                # Get top 3 most similar chunks
-                top_indices = similarity.argsort()[-3:][::-1]
-                for idx in top_indices:
-                    if similarity[idx] > 0.1:  # Threshold to filter irrelevant results
-                        all_relevant_chunks.append(chunks[idx])
-                        all_similarity_scores.append(similarity[idx])
-            except Exception as e:
-                logger.error(f"Error processing collection {collection}: {str(e)}")
+                sentence_words = set(sentence.lower().split())
+                if len(question_words.intersection(sentence_words)) > 0:
+                    relevant_sentences.append(sentence)
         
-        if not all_relevant_chunks:
-            return AnswerResponse(
-                question=request.question,
-                answer="I couldn't find any relevant information to answer your question.",
-                sources=[]
-            )
+        if relevant_sentences:
+            answer_text = "Based on the documents:\n\n"
+            answer_text += "\n".join(["- " + sentence for sentence in relevant_sentences[:5]])
+            answer_text += "\n\nThe information most relevant to your question is found in the sections above."
+        else:
+            answer_text = "I couldn't find specific information directly addressing your question in the documents. Here's the most relevant content I found:\n\n"
+            answer_text += context[:500] + "..."
         
-        # Sort chunks by similarity score
-        combined = list(zip(all_relevant_chunks, all_similarity_scores))
-        combined.sort(key=lambda x: x[1], reverse=True)
+        sources = []
+        for doc in docs:
+            source_info = {
+                "content": doc.page_content[:200] + "..." if len(doc.page_content) > 200 else doc.page_content,
+                "metadata": doc.metadata
+            }
+            sources.append(source_info)
         
-        # Take top 5 chunks
-        top_chunks = [chunk for chunk, _ in combined[:5]]
-        context = "\n\n".join(top_chunks)
-        
-        # Simple answer generation (in production, this would use an LLM)
-        answer = f"Based on the documents, I found information related to your question. Here is a relevant excerpt:\n\n{context[:500]}..."
-        
-        # In a real implementation with LLM, you would use something like:
-        # answer = llm.generate(prompt=f"Context: {context}\n\nQuestion: {request.question}\n\nAnswer:")
-        
-        return AnswerResponse(
-            question=request.question,
-            answer=answer,
-            sources=document_titles
-        )
+        return Answer(answer=answer_text, sources=sources)
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error in question answering: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
 
-# Run the application
+@app.delete("/documents/{document_id}", response_model=Dict[str, str], responses={404: {"model": ErrorResponse}, 500: {"model": ErrorResponse}})
+async def delete_document(document_id: int, connection=Depends(get_db)):
+    try:
+        row = await connection.fetchrow("SELECT id FROM documents WHERE id = $1", document_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Document not found")
+        
+        await connection.execute("DELETE FROM documents WHERE id = $1", document_id)
+        
+        return {"message": f"Document {document_id} deleted successfully (note: chunks still in vector store)"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete document: {str(e)}")
+
+@app.get("/health", response_model=Dict[str, Any])
+async def health_check():
+    status = "healthy"
+    components = {
+        "database": "connected" if app.state.db_pool else "disconnected",
+        "vector_store": "initialized" if app.state.vector_store else "not initialized",
+    }
+    
+    if app.state.has_error or not app.state.db_pool:
+        status = "degraded"
+    
+    return {
+        "status": status,
+        "components": components
+    }
+
+@app.get("/models", response_model=Dict[str, Any])
+async def available_models():
+    return {
+        "retrieval_method": "TF-IDF",
+        "vector_store_path": VECTOR_STORE_PATH,
+        "recommended_future_models": [
+            {"id": "mistralai/Mistral-7B-Instruct-v0.2", "description": "Good general purpose model"},
+            {"id": "sentence-transformers/all-mpnet-base-v2", "description": "Strong embedding model for retrieval"},
+            {"id": "facebook/bart-large-cnn", "description": "Optimized for summarization"},
+            {"id": "deepset/roberta-base-squad2", "description": "Specialized for QA"}
+        ]
+    }
+
 if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+    import uvicorn
+    uvicorn.run(
+        "app:app",
+        host="0.0.0.0", 
+        port=8000,
+        log_level="info",
+        reload=True
+    )
