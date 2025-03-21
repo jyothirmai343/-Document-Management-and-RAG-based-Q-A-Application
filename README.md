@@ -295,11 +295,3 @@ COPY . .
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
 ```
 
-## Limitations and Future Improvements
-
-1. The current implementation does not support updating documents
-2. When documents are deleted from the database, their chunks remain in the vector store
-3. The TF-IDF implementation is basic and could be enhanced with more sophisticated techniques
-4. The query response is simplistic and could be improved with a more advanced LLM integration
-5. Authentication and authorization are not implemented
-6. No pagination for document listing
